@@ -1,4 +1,6 @@
 import hashlib
+import os
+import requests as http_requests
 from django.db import connection
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -104,6 +106,72 @@ class LoginView(APIView):
         return Response({"message": "Login successful", "user": user_to_dict(user), "tokens": tokens})
 
 
+class GoogleAuthView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        credential = request.data.get("credential", "").strip()
+        if not credential:
+            return Response({"error": "Google credential is required"}, status=400)
+
+        try:
+            resp = http_requests.get(
+                f"https://oauth2.googleapis.com/tokeninfo?id_token={credential}",
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return Response({"error": "Invalid Google token"}, status=401)
+            google_data = resp.json()
+        except Exception:
+            return Response({"error": "Failed to verify Google token"}, status=500)
+
+        client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+        if client_id and google_data.get("aud") != client_id:
+            return Response({"error": "Token audience mismatch"}, status=401)
+
+        email      = google_data.get("email", "").strip().lower()
+        name       = google_data.get("name", "").strip() or email.split("@")[0]
+        google_sub = google_data.get("sub", "")
+        avatar_url = google_data.get("picture", "")
+
+        if not email:
+            return Response({"error": "Could not get email from Google"}, status=400)
+
+        with connection.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE email = %s AND is_active = TRUE", [email])
+            row = cur.fetchone()
+
+            if row:
+                cols = [d[0] for d in cur.description]
+                user = dict(zip(cols, row))
+                cur.execute("""
+                    UPDATE users
+                    SET google_sub         = COALESCE(NULLIF(google_sub, ''), %s),
+                        profile_photo_url  = COALESCE(NULLIF(profile_photo_url, ''), %s)
+                    WHERE id = %s
+                """, [google_sub, avatar_url, user["id"]])
+
+                if user.get("role") == "recruiter" and not user.get("is_approved"):
+                    return Response({"error": "Your recruiter account is pending admin approval"}, status=403)
+            else:
+                cur.execute("""
+                    INSERT INTO users
+                        (email, password_hash, name, role, is_approved, google_sub, profile_photo_url)
+                    VALUES (%s, %s, %s, 'student', TRUE, %s, %s)
+                    RETURNING *
+                """, [email, "", name, google_sub, avatar_url])
+                row  = cur.fetchone()
+                cols = [d[0] for d in cur.description]
+                user = dict(zip(cols, row))
+
+        tokens = get_tokens(user["id"])
+        return Response({
+            "message": "Google login successful",
+            "user":    user_to_dict(user),
+            "tokens":  tokens,
+        })
+
+
 class ProfileView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -128,7 +196,13 @@ class ProfileView(APIView):
 
     def patch(self, request):
         user_id = request.user.id
-        allowed = {"name","branch","year","university","bio","github_url","linkedin_url","portfolio_url","profile_photo_url","preferred_mode"}
+        allowed = {
+            "name", "branch", "year", "university", "bio",
+            "github_url", "linkedin_url", "portfolio_url",
+            "profile_photo_url", "preferred_mode",
+            # Settings fields
+            "settings_notifications", "settings_privacy", "settings_preferences",
+        }
         updates = {k: v for k, v in request.data.items() if k in allowed}
         if not updates:
             return Response({"error": "No valid fields to update"}, status=400)
@@ -140,6 +214,26 @@ class ProfileView(APIView):
             cols = [d[0] for d in cur.description]
             user = dict(zip(cols, row))
         return Response(user_to_dict(user))
+
+    def delete(self, request):
+        """DELETE /api/users/me/ — permanently delete the authenticated user's account."""
+        user_id = request.user.id
+        with connection.cursor() as cur:
+            # Cascade-delete dependent rows first (in case FK constraints aren't set to CASCADE)
+            cur.execute("DELETE FROM applications  WHERE user_id = %s", [user_id])
+            cur.execute("DELETE FROM saved_internships WHERE user_id = %s", [user_id])
+            cur.execute("DELETE FROM user_skills   WHERE user_id = %s", [user_id])
+            cur.execute("DELETE FROM match_scores  WHERE user_id = %s", [user_id])
+            cur.execute("DELETE FROM users         WHERE id = %s", [user_id])
+        return Response(status=204)
+
+
+class MeDeleteView(APIView):
+    """Alias: DELETE /api/users/me/ routed separately if needed."""
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request):
+        return ProfileView().delete(request)
 
 
 class SkillsView(APIView):
@@ -209,23 +303,15 @@ class StatsView(APIView):
 
 
 class ComputeMatchScoresView(APIView):
-    """
-    POST /api/users/compute-matches/
-    Computes skill-overlap match scores for every active internship vs this user.
-    Also recalculates profile_strength and writes both back to the DB.
-    Returns { profile_strength, top_match_score, computed }.
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         user_id = request.user.id
         import json as _json
         with connection.cursor() as cur:
-            # 1. Fetch user's tag IDs
             cur.execute("SELECT tag_id FROM user_skills WHERE user_id = %s", [user_id])
             user_tag_ids = {row[0] for row in cur.fetchall()}
 
-            # 2. Fetch ALL active internships with their tag sets (LEFT JOIN so untagged appear too)
             cur.execute("""
                 SELECT i.id, COALESCE(array_agg(it.tag_id) FILTER (WHERE it.tag_id IS NOT NULL), '{}') AS tag_ids
                 FROM internships i
@@ -235,13 +321,11 @@ class ComputeMatchScoresView(APIView):
             """)
             internships = cur.fetchall()
 
-            # 3. Compute score for each internship
             computed = 0
             for intern_id, intern_tag_ids in internships:
                 intern_tags = set(intern_tag_ids or [])
 
                 if not intern_tags:
-                    # No tag data — assign neutral base score so it appears in recommendations
                     score   = 50
                     missing = []
                     verdict = "moderate"
@@ -261,28 +345,19 @@ class ComputeMatchScoresView(APIView):
                 """, [user_id, intern_id, score, verdict, _json.dumps(missing)])
                 computed += 1
 
-            # 4. Compute profile_strength
             cur.execute("SELECT * FROM users WHERE id = %s", [user_id])
             row  = cur.fetchone()
             cols = [d[0] for d in cur.description]
             user = dict(zip(cols, row))
 
             checks = [
-                user.get("name"),
-                user.get("branch"),
-                user.get("year"),
-                user.get("bio"),
-                user.get("github_url"),
-                user.get("linkedin_url"),
-                user.get("portfolio_url"),
-                len(user_tag_ids) >= 3,
-                len(user_tag_ids) >= 7,
-                len(user_tag_ids) >= 1,
+                user.get("name"), user.get("branch"), user.get("year"), user.get("bio"),
+                user.get("github_url"), user.get("linkedin_url"), user.get("portfolio_url"),
+                len(user_tag_ids) >= 3, len(user_tag_ids) >= 7, len(user_tag_ids) >= 1,
             ]
             strength = round((sum(1 for c in checks if c) / len(checks)) * 100)
             cur.execute("UPDATE users SET profile_strength = %s WHERE id = %s", [strength, user_id])
 
-            # 5. Top match score
             cur.execute("SELECT MAX(score) FROM match_scores WHERE user_id = %s", [user_id])
             top_match = cur.fetchone()[0] or 0
 
