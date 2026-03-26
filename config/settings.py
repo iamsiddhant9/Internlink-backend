@@ -1,14 +1,18 @@
 from pathlib import Path
 from decouple import config
+import dj_database_url
+import os
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = config("SECRET_KEY")
-ADZUNA_APP_ID  = config("ADZUNA_APP_ID")
-ADZUNA_APP_KEY = config("ADZUNA_APP_KEY")
+SECRET_KEY = config("SECRET_KEY", default="django-insecure-default-key-for-dev-only")
+ADZUNA_APP_ID  = config("ADZUNA_APP_ID", default="")
+ADZUNA_APP_KEY = config("ADZUNA_APP_KEY", default="")
 GROQ_API_KEY = config("GROQ_API_KEY", default="")
 DEBUG = config("DEBUG", default=False, cast=bool)
+
+# Allow all hosts for easy deployment
 ALLOWED_HOSTS = ["*"]
 
 
@@ -66,17 +70,26 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 
 # ── Database ──────────────────────────────────────────────────────────────────
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME":     config("DB_NAME"),
-        "USER":     config("DB_USER"),
-        "PASSWORD": config("DB_PASSWORD", default=""),
-        "HOST":     config("DB_HOST", default="localhost"),
-        "PORT":     config("DB_PORT", default="5432"),
-        "CONN_MAX_AGE": 60,
+if config("DATABASE_URL", default=""):
+    DATABASES = {
+        "default": dj_database_url.config(
+            default=config("DATABASE_URL"),
+            conn_max_age=60,
+            conn_health_checks=True,
+        )
     }
-}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME":     config("DB_NAME", default="internlinkdb"),
+            "USER":     config("DB_USER", default="postgres"),
+            "PASSWORD": config("DB_PASSWORD", default=""),
+            "HOST":     config("DB_HOST", default="localhost"),
+            "PORT":     config("DB_PORT", default="5432"),
+            "CONN_MAX_AGE": 60,
+        }
+    }
 
 # ── Password validation ───────────────────────────────────────────────────────
 AUTH_PASSWORD_VALIDATORS = [
@@ -120,11 +133,7 @@ SIMPLE_JWT = {
 }
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",   # Vite dev server
-    "http://localhost:5174",
-    "http://localhost:5175",
-    "http://localhost:3000",
-]
+# Allow all origins for the deployed API to easily connect with Vercel/Netlify
+CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
 

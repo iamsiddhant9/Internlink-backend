@@ -120,7 +120,7 @@ class SkillGapView(APIView):
         try:
             with connection.cursor() as cur:
                 cur.execute(
-                    "SELECT name FROM user_skills WHERE user_id = %s",
+                    "SELECT t.name FROM user_skills us JOIN tags t ON us.tag_id = t.id WHERE us.user_id = %s",
                     [user_id]
                 )
                 user_skills = [row[0] for row in cur.fetchall()]
@@ -144,14 +144,17 @@ class SkillGapView(APIView):
             tag_list = ["Python", "React", "Node.js", "Docker", "SQL", "AWS", "TypeScript"]
 
         prompt = f"""
-You are a career advisor. A student has these skills:
-{', '.join(user_skills) if user_skills else 'No skills listed yet'}
+You are an expert career advisor for software engineering students. 
+A student has exactly these existing skills:
+[{', '.join(user_skills) if user_skills else 'No skills listed yet'}]
 
-The top internships require these technologies/skills:
-{', '.join(tag_list) if tag_list else 'Python, React, Docker, AWS, SQL'}
+The top internships in the market require these technologies/skills:
+[{', '.join(tag_list) if tag_list else 'Python, React, Docker, AWS, SQL'}]
 
-Identify the 5 most important skills this student is MISSING that would most increase their internship match rate.
-For each, give a brief reason and a specific free learning resource.
+Identify exactly 5 high-impact skills this student is MISSING that would dramatically increase their internship match rate.
+CRITICAL RULE: YOU MUST NOT RECOMMEND ANY SKILL THAT IS ALREADY IN THE STUDENT'S EXISTING SKILL LIST ABOVE.
+If the student already has 'React', do not recommend 'React' or 'React.js', etc.
+For each missing skill, give a brief reason and a specific free learning resource.
 
 Respond ONLY with valid JSON — a list of exactly 5 objects:
 [

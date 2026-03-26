@@ -91,7 +91,7 @@ class ApplicationDetailView(APIView):
 
         with connection.cursor() as cur:
             cur.execute(
-                f"UPDATE applications SET {set_clause} WHERE id = %s AND user_id = %s RETURNING id, status, stage, notes, updated_at",
+                f"UPDATE applications SET {set_clause} WHERE id = %s AND user_id = %s RETURNING id, status, stage, notes, updated_at, internship_id",
                 values
             )
             row = cur.fetchone()
@@ -99,6 +99,29 @@ class ApplicationDetailView(APIView):
                 return Response({"error": "Application not found"}, status=404)
             cols = [d[0] for d in cur.description]
             result = {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in zip(cols, row)}
+
+            # --- Simple Notification Engine Trigger ---
+            if "status" in updates and updates["status"] in ["Interview", "Offer"]:
+                cur.execute("SELECT i.title, c.name FROM internships i LEFT JOIN companies c ON c.id = i.company_id WHERE i.id = %s", [result["internship_id"]])
+                intern_info = cur.fetchone()
+                if intern_info:
+                    title, company = intern_info
+                    message = f"Congratulations! Your application for {title} at {company} has been updated to '{updates['status']}'."
+                    
+                    from users.models import Notification
+                    Notification.objects.create(
+                        user_id=user_id,
+                        title=f"Application Update: {updates['status']}",
+                        message=message,
+                        type="update"
+                    )
+
+                    # Simulate Email Backend
+                    print(f"\n[{'='*40}]\n SIMULATED EMAIL NOTIFICATION\n[{'='*40}]")
+                    print(f"To: User ID {user_id}")
+                    print(f"Subject: Status Update! ({title})")
+                    print(f"Body:\n{message}")
+                    print(f"[{'='*40}]\n")
 
         return Response(result)
 

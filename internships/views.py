@@ -138,12 +138,36 @@ class RecommendationsView(APIView):
                 LEFT JOIN companies c ON c.id = i.company_id
                 LEFT JOIN internship_tags it ON it.internship_id = i.id
                 LEFT JOIN tags t ON t.id = it.tag_id
-                WHERE ms.user_id = %s AND i.is_active = TRUE
+                WHERE ms.user_id = %s AND i.is_active = TRUE AND ms.score > 0
                 GROUP BY i.id, c.name, c.logo_url, ms.score, ms.verdict, ms.missing_skills
                 ORDER BY ms.score DESC
                 LIMIT %s
             """, [user_id, limit])
             recs = rows_to_dicts(cur)
+
+        # Fallback — pad with newest internships if we don't have enough matches
+        if len(recs) < limit:
+            exclude_ids = [r['id'] for r in recs]
+            exclude_clause = "AND i.id != ALL(%s)" if exclude_ids else ""
+            params = [limit - len(recs)] if not exclude_ids else [exclude_ids, limit - len(recs)]
+            
+            with connection.cursor() as cur:
+                cur.execute(f"""
+                    SELECT i.id, i.title, i.location, i.mode, i.category,
+                           i.stipend, i.deadline, i.apply_url,
+                           c.name AS company, c.logo_url,
+                           NULL AS match_score,
+                           ARRAY_AGG(t.name) FILTER (WHERE t.name IS NOT NULL) AS tags
+                    FROM internships i
+                    LEFT JOIN companies c ON c.id = i.company_id
+                    LEFT JOIN internship_tags it ON it.internship_id = i.id
+                    LEFT JOIN tags t ON t.id = it.tag_id
+                    WHERE i.is_active = TRUE {exclude_clause}
+                    GROUP BY i.id, c.name, c.logo_url, i.created_at
+                    ORDER BY i.created_at DESC
+                    LIMIT %s
+                """, params)
+                recs.extend(rows_to_dicts(cur))
 
         # Fallback — no match scores yet, return newest
         if not recs:
